@@ -9,7 +9,10 @@
 %% the Windows callback struct keeps proper integrity.  Such functions
 %% must begin with "dummy."
 %%
-api_list(Version, UlongSize, HasDirtySchedulers) when Version=={2,7} orelse Version=={2,8} -> [
+api_list(Version, Wordsize, HasDirtySchedulers)
+  when Version =:= {2,7};
+       Version =:= {2,8};
+       Version =:= {2,9} -> [
 
     {"*mut c_void", "enif_priv_data", "arg1: *mut ErlNifEnv"},
     {"*mut c_void", "enif_alloc", "size: size_t"},
@@ -152,14 +155,14 @@ api_list(Version, UlongSize, HasDirtySchedulers) when Version=={2,7} orelse Vers
     {"ERL_NIF_TERM", "enif_make_resource_binary", "arg1: *mut ErlNifEnv, obj: *mut c_void, data: *const c_void, size: size_t"}
     ] ++
 
-    case UlongSize of
+    case Wordsize of
         8 -> [];
         4 ->
             [
-                {"c_int", "enif_get_int64", "arg1: *mut ErlNifEnv, term: ERL_NIF_TERM, ip: *mut c_longlong"},
-                {"c_int", "enif_get_uint64", "arg1: *mut ErlNifEnv, term: ERL_NIF_TERM, ip: *mut c_ulonglong"},
-                {"ERL_NIF_TERM", "enif_make_int64", "env: *mut ErlNifEnv, i: c_longlong"},
-                {"ERL_NIF_TERM", "enif_make_uint64", "env: *mut ErlNifEnv, i: c_ulonglong"}
+                {"c_int", "enif_get_int64", "arg1: *mut ErlNifEnv, term: ERL_NIF_TERM, ip: *mut int64_t"},
+                {"c_int", "enif_get_uint64", "arg1: *mut ErlNifEnv, term: ERL_NIF_TERM, ip: *mut uint64_t"},
+                {"ERL_NIF_TERM", "enif_make_int64", "env: *mut ErlNifEnv, i: int64_t"},
+                {"ERL_NIF_TERM", "enif_make_uint64", "env: *mut ErlNifEnv, i: uint64_t"}
             ]
 
     end ++ [
@@ -188,13 +191,24 @@ api_list(Version, UlongSize, HasDirtySchedulers) when Version=={2,7} orelse Vers
 
 
 
-    case Version of
-        {2,8} -> [
+    case lists:member(Version, [{2,8}, {2,9}]) of
+        true -> [
             {"c_int", "enif_has_pending_exception", "env: *mut ErlNifEnv, reason: *mut ERL_NIF_TERM"},
             {"ERL_NIF_TERM", "enif_raise_exception", "env: *mut ErlNifEnv, reason: ERL_NIF_TERM"}
         ];
+        false -> []
+    end ++
+
+
+
+    case Version of
+        {2,9} -> [
+            {"c_int", "enif_getenv", "key: *const c_uchar, value: *mut c_uchar, value_size: *mut size_t"}
+        ];
         _ -> []
     end ++
+
+
 
     case HasDirtySchedulers of
         true -> [{"c_int", "enif_is_on_dirty_scheduler", "env: *mut ErlNifEnv"}  ];
@@ -202,74 +216,55 @@ api_list(Version, UlongSize, HasDirtySchedulers) when Version=={2,7} orelse Vers
     end.
 
 
-main([UlongSizeT]) -> main([UlongSizeT,"."]);
-main([UlongSizeT, OutputDir]) ->
-
-    UlongSize = case UlongSizeT of
-        "4" -> 4;
-        "8" -> 8
-    end,
+main([]) -> main(["."]);
+main([OutputDir]) ->
 
     %% Collect and check erlang configuration
     Version = get_nif_version(),
     check_version(Version),
 
+    Wordsize = erlang:system_info(wordsize),
     HasDirtySchedulers = case catch erlang:system_info(dirty_cpu_schedulers) of
                              _X when is_integer(_X) -> true;
                              _ -> false
                          end,
 
     %% Generate API list
-    Entries = api_list(Version, UlongSize, HasDirtySchedulers),
+    Entries = api_list(Version, Wordsize, HasDirtySchedulers),
 
-    %% Generate Rust code
-    Rust = [
-        nif_version_rust(Version),
-        api_bindings_rust(erlang:system_info(system_architecture), Entries),
-        int64_mappers_rust(UlongSize)
-    ],
+    %% Emit bindings
+    emit_nif_version(Version, OutputDir),
 
-    Filename = filename:join(OutputDir, "nif_api.snippet"),
-    file:write_file(Filename, Rust),
+    %% Emit type aliases
+    % emit_type_aliases(Version),
+
+    case erlang:system_info(system_architecture) of
+        "win32" -> emit_windows_bindings(Entries, OutputDir);
+        _ -> emit_unix_bindings(Entries, OutputDir)
+    end,
+
     ok.
 
-nif_version_rust({Major, Minor}) ->
-    [io_lib:format("pub const NIF_MAJOR_VERSION: c_int = ~p;\n", [Major]),
-     io_lib:format("pub const NIF_MINOR_VERSION: c_int = ~p;\n\n", [Minor])].
 
-api_bindings_rust("win32", Entries) ->
-    [ "#[allow(raw_pointer_derive)]\n",
-      "#[derive(Copy, Clone)]\n",
-      "pub struct TWinDynNifCallbacks {\n",
-            [ case Return of
-                  "" ->
-                      io_lib:format("    ~s: fn(~s),\n",[Name,Params]);
-                  _ ->
-                      io_lib:format("    ~s: fn(~s) -> ~s,\n",[Name,Params,Return])
-              end || {Return,Name,Params} <- Entries],
+emit_nif_version({Major, Minor}, OutputDir) ->
+    Filename = filename:join(OutputDir, "nif_versions.snippet"),
+    Data = [io_lib:format("pub const NIF_MAJOR_VERSION: c_int = ~p;\n", [Major]),
+            io_lib:format("pub const NIF_MINOR_VERSION: c_int = ~p;\n", [Minor])],
 
-            "}\n\n",
+    file:write_file(Filename, Data).
 
-            % The line below would be the "faithful" reproduction of the NIF Win API, but Rust
-            % is current not allowing statics to be uninitialized (1.3 beta).  Revisit this when
-            % RFC911 is implemented (or some other mechanism)
-            %"static mut WinDynNifCallbacks:TWinDynNifCallbacks = unsafe{std::mem::uninitialized()};\n\n",
 
-            % The work-around is to use Option.  The problem here is that we have to do an unwrap() for
-            % each API call which is extra work.
-            "pub static mut WinDynNifCallbacks:Option<TWinDynNifCallbacks> = None;\n\n",
+% emit_type_aliases({2,7}) ->
+%     Filename = filename:join(OutputDir, "nif_type_aliases.snippet"),
+%     Data = [],
+%     file:write_file(Filename, Data).
 
-            [ [io_lib:format("/// See [~s](http://www.erlang.org/doc/man/erl_nif.html#~s) in the Erlang docs.\n", [Name, Name]),
-               case Return of
-                  "" ->
-                      io_lib:format("#[inline]\npub fn ~s(~s) {\n    unsafe{(WinDynNifCallbacks.unwrap().~s)(~s)\n}}\n\n",[Name,Params,Name,strip_types_from_params(Params)]);
-                  _ ->
-                      io_lib:format("#[inline]\npub fn ~s(~s) -> ~s {\n    unsafe{(WinDynNifCallbacks.unwrap().~s)(~s)\n}}\n\n",[Name,Params,Return,Name,strip_types_from_params(Params)])
-               end] || {Return,Name,Params} <- Entries, not is_dummy(Name)]
-            ];
+%% When ABIs diverge we can add things like "type ErlNifBinary = ErlNifBinary_2_7;"
 
-api_bindings_rust(_Arch, Entries) ->
-    [ 
+
+emit_unix_bindings(Entries, OutputDir) ->
+    Filename = filename:join(OutputDir, "nif_api.snippet"),
+    Data = [ 
         "extern \"C\" {\n",
              [ [io_lib:format("/// See [~s](http://www.erlang.org/doc/man/erl_nif.html#~s) in the Erlang docs.\n", [Name, Name]),
                 case Return of
@@ -279,25 +274,41 @@ api_bindings_rust(_Arch, Entries) ->
                        io_lib:format("pub fn ~s(~s) -> ~s;\n",[Name,Params,Return])
                 end] || {Return,Name,Params} <- Entries, not is_dummy(Name)],
              "}\n"
-    ].
+    ],
+    file:write_file(Filename, Data).
 
 is_dummy([$d,$u,$m,$m,$y|_]) -> true;
 is_dummy(_) -> false.
 
+emit_windows_bindings(Entries, OutputDir) ->
+    io:format("Windows binding generation not yet implemented.\n"),
+    halt(1),
+
+    %% That said, here's a sketch of how Windows bindings are going to work...
+    Filename = filename:join(OutputDir, "nif_api.snippet"),
+
+    Data = ["struct TWinDynNifCallbacks {\n",
+            [ case Return of
+                  "" ->
+                      io:format("~s: fn(~s),\n",[Name,Params]);
+                  _ ->
+                      io:format("~s: fn(~s) -> ~s,\n",[Name,Params,Return])
+              end || {Return,Name,Params} <- Entries],
+
+            "}\n\n",
+            "static TWinDynNifCallbacks: WinDynNifCallbacks;\n\n",
+
+            [ case Return of
+                  "" ->
+                      io:format("#[inline] pub fn ~s(~s) {WinDynNifCallbacks.~s~s}\n",[Name,Params,Name,Params]);
+                  _ ->
+                      io:format("#[inline] pub fn ~s(~s) -> ~s {WinDynNifCallbacks.~s~s}\n",[Name,Params,Return,Name,Params])
+              end || {Return,Name,Params} <- Entries, not is_dummy(Name)],
+            "\n\n"],
+
+    file:write_file(Filename, Data).
 
 
-%% Strip types from Rust function definition, example:
-%% "arg1: *mut ErlNifEnv, i: c_uint" -> "arg1, i"
-strip_types_from_params(Params) ->
-    ParamsCleaned0 = re:replace(Params, " ", ""),  % strip spaces
-    ParamsCleaned = re:replace(ParamsCleaned0, "\\(.*\\)", ""), % strip nested function params
-    ParamsL = re:split(ParamsCleaned, ","),
-    ArgsL = [ re:replace(Param, ":.*", "") || Param <- ParamsL ], % strip type info
-    join(ArgsL, ", ").
-
-join(List, Joiner) -> join([], List, Joiner).
-join(Acc, [H], _Joiner) -> lists:reverse([H|Acc]);
-join(Acc, [H|T], Joiner) -> join([Joiner, H|Acc], T, Joiner).
 
 get_nif_version() ->
     Ver = (catch erlang:system_info(nif_version)),
@@ -305,40 +316,10 @@ get_nif_version() ->
 
 version_string2tuple("2.7") -> {2,7};
 version_string2tuple("2.8") -> {2,8};
+version_string2tuple("2.9") -> {2,9};
 version_string2tuple(_) -> unsupported.
 
 check_version(unsupported) ->
         io:format("Unsupported Erlang version.\n"),
         halt(1);
 check_version(Version = {_,_}) -> Version.
-
-
-%% These functions are defined in the API above when sizeof(ulong)==8, or they map to
-%% long/ulong functions when sizeof(ulong)==4.
-int64_mappers_rust(4) -> join([
-    "use libc::c_ulonglong;",
-    "use libc::c_longlong;"
-    ],
-    "\n");
-
-int64_mappers_rust(8) -> join([
-    "/// See [enif_make_int64](http://www.erlang.org/doc/man/erl_nif.html#enif_make_int64) at erlang.org",
-    "#[inline]",
-    "pub fn enif_make_int64(env: *mut ErlNifEnv, i: i64) -> ERL_NIF_TERM",
-    "    { unsafe {enif_make_long(env, i)}}",
-    "",
-    "/// See [enif_make_uint64](http://www.erlang.org/doc/man/erl_nif.html#enif_make_uint64) at erlang.org",
-    "#[inline]",
-    "pub fn enif_make_uint64(env: *mut ErlNifEnv, i: u64) -> ERL_NIF_TERM",
-    "    { unsafe {enif_make_ulong(env, i) }}",
-    "",
-    "/// See [enif_get_int64](http://www.erlang.org/doc/man/erl_nif.html#enif_get_int64) at erlang.org",
-    "#[inline]",
-    "pub fn enif_get_int64(env: *mut ErlNifEnv, term: ERL_NIF_TERM, ip: *mut i64) -> c_int",
-    "    { unsafe {enif_get_long(env, term, ip) }}",
-    "",
-    "/// See [enif_get_uint64](http://www.erlang.org/doc/man/erl_nif.html#enif_get_uint64) at erlang.org",
-    "#[inline]",
-    "pub fn enif_get_uint64(env: *mut ErlNifEnv, term: ERL_NIF_TERM, ip: *mut u64) -> c_int",
-    "    { unsafe {enif_get_ulong(env, term, ip) }}"],
-    "\n").
